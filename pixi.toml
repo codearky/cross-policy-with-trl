@@ -1,0 +1,34 @@
+[project]
+name = "cross-policy-with-trl"
+version = "0.0.1"
+description = "Cross-policy GRPO experiments on top of TRL (editable install)."
+channels = ["conda-forge", "pytorch", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.10,<3.12"
+pip = "*"
+# Torch is intentionally installed via conda for reliability.
+pytorch = ">=2.4"
+pytorch-cuda = "12.1.*"
+pandas = "*"
+
+[pypi-dependencies]
+# Install this repo's TRL fork as editable from ./trl
+trl = { path = "trl", editable = true }
+# Explicit runtime deps (also pulled via TRL, but pinned here for clarity)
+transformers = ">=4.56.1"
+accelerate = ">=1.4.0"
+datasets = ">=3.0.0"
+# Common Qwen tokenizer/runtime extras
+sentencepiece = "*"
+tiktoken = "*"
+einops = "*"
+num2words = "==0.5.14"
+
+[tasks]
+train-cross-policy = "python trl/examples/scripts/cross_policy_grpo.py --reset_buffer"
+train-policy0 = "python trl/examples/scripts/cross_policy_grpo.py --policy_id 0"
+train-policy1 = "python trl/examples/scripts/cross_policy_grpo.py --policy_id 1"
+
+
