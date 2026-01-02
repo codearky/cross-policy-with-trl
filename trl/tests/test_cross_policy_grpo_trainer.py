@@ -39,6 +39,23 @@ def test_success_buffer_dedup_and_exclude_src():
     assert sampled
     assert all(x.src != 1 for x in sampled)
 
+def test_success_buffer_consumable_sample():
+    from trl.trainer.cross_policy_grpo_trainer import SuccessBuffer, SuccessBufferItem
+
+    buf = SuccessBuffer(max_size=10, dedup=True, seed=0)
+    buf.add(SuccessBufferItem(prompt="p1", completion="c1", reward=1.0, src=0))
+    buf.add(SuccessBufferItem(prompt="p2", completion="c2", reward=1.0, src=1))
+    assert len(buf) == 2
+
+    taken = buf.sample(1, consume=True)
+    assert len(taken) == 1
+    assert len(buf) == 1
+
+    # Taking remaining with consume should empty it
+    taken2 = buf.sample(10, consume=True)
+    assert len(taken2) == 1
+    assert len(buf) == 0
+
 
 def test_pooled_advantages_zscore_and_rank():
     from trl.trainer.cross_policy_grpo_trainer import pooled_advantages
@@ -56,5 +73,27 @@ def test_pooled_advantages_zscore_and_rank():
     assert torch.isfinite(adv_rank).all()
     assert adv_rank.min().item() >= -0.5 - 1e-6
     assert adv_rank.max().item() <= 0.5 + 1e-6
+
+
+def test_sample_requires_full_batch_flag():
+    from types import SimpleNamespace
+
+    from trl.trainer.cross_policy_grpo_trainer import CrossPolicyGRPOTrainer, SuccessBuffer, SuccessBufferItem
+
+    trainer = CrossPolicyGRPOTrainer.__new__(CrossPolicyGRPOTrainer)
+    trainer._cp_buffer = SuccessBuffer(max_size=10, dedup=True, seed=0)
+    trainer.cp_args = SimpleNamespace(
+        cross_policy_policy_id=0,
+        cross_policy_success_buffer_consumable=False,
+        cross_policy_sft_require_full_batch=True,
+    )
+
+    trainer._cp_buffer.add(SuccessBufferItem("p1", "c1", 1.0, 1))
+    batch = CrossPolicyGRPOTrainer._sample_cross_policy_sft_batch(trainer, 2)
+    assert batch == []
+
+    trainer._cp_buffer.add(SuccessBufferItem("p2", "c2", 1.0, 1))
+    batch = CrossPolicyGRPOTrainer._sample_cross_policy_sft_batch(trainer, 2)
+    assert len(batch) == 2
 
 

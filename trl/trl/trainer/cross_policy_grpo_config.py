@@ -43,6 +43,13 @@ class CrossPolicyGRPOConfig(GRPOConfig):
             "If provided, the trainer will append successes to this file and sample from it."
         },
     )
+    cross_policy_success_buffer_consumable: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, samples pulled from the success buffer are removed from it (non-returnable sampling). "
+            "For JSONL buffers this is best-effort via a sidecar consumed-keys file."
+        },
+    )
     cross_policy_success_threshold: float = field(
         default=1.0,
         metadata={
@@ -83,6 +90,13 @@ class CrossPolicyGRPOConfig(GRPOConfig):
         default=0,
         metadata={
             "help": "How many success-buffer samples (from other policies) to use per SFT step. 0 disables SFT steps."
+        },
+    )
+    cross_policy_sft_require_full_batch: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, skip cross-policy SFT steps unless at least `cross_policy_sft_batch_size` samples can be "
+            "drawn from the buffer. Samples are not removed when skipping."
         },
     )
     cross_policy_mix_alpha: float = field(

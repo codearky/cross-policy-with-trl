@@ -17,12 +17,13 @@ from __future__ import annotations
 import json
 import os
 import random
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from accelerate.logging import get_logger
+from accelerate.state import PartialState
 from accelerate.utils import gather_object
 from transformers import PreTrainedModel
 
@@ -31,6 +32,15 @@ from .cross_policy_grpo_config import CrossPolicyGRPOConfig
 from .grpo_trainer import GRPOTrainer
 
 logger = get_logger(__name__)
+
+
+def _log_info(message: str) -> None:
+    if PartialState._shared_state:
+        logger.info(message)
+    else:
+        import logging
+
+        logging.getLogger("trl.cross_policy").info(message)
 
 
 def _json_dumps_fallback(obj: Any) -> str:
@@ -101,7 +111,17 @@ class SuccessBuffer:
             inserted += int(self.add(it))
         return inserted
 
-    def sample(self, k: int, exclude_src: int | None = None) -> list[SuccessBufferItem]:
+    def available_count(self, exclude_src: int | None = None) -> int:
+        if exclude_src is None:
+            return len(self._items)
+        return sum(1 for it in self._items if it.src != exclude_src)
+
+    def _build_counter(self, items: list[SuccessBufferItem]) -> Counter:
+        if self.dedup:
+            return Counter(it.dedup_key() for it in items)
+        return Counter(id(it) for it in items)
+
+    def sample(self, k: int, exclude_src: int | None = None, consume: bool = False) -> list[SuccessBufferItem]:
         if k <= 0 or not self._items:
             return []
 
@@ -112,12 +132,38 @@ class SuccessBuffer:
         if not population:
             return []
 
+        # Determine chosen items (without replacement)
         if k >= len(population):
-            # Deterministic-ish shuffle so callers don't always see the same prefix
-            population = population[:]
-            self._rng.shuffle(population)
-            return population
-        return self._rng.sample(population, k)
+            chosen = population[:]
+            self._rng.shuffle(chosen)
+        else:
+            chosen = self._rng.sample(population, k)
+
+        if consume and chosen:
+            self.consume_items(chosen)
+
+        return chosen
+
+    def consume_items(self, items: list[SuccessBufferItem]) -> None:
+        if not items:
+            return
+
+        counters = self._build_counter(items)
+        new_items: deque[SuccessBufferItem] = deque()
+        new_dedup: set[str] = set()
+
+        for it in self._items:
+            key = it.dedup_key() if self.dedup else id(it)
+            if counters.get(key, 0) > 0:
+                counters[key] -= 1
+                continue
+            new_items.append(it)
+            if self.dedup:
+                new_dedup.add(it.dedup_key())
+
+        self._items = new_items
+        if self.dedup:
+            self._dedup_keys = new_dedup
 
 
 class JsonlSuccessBuffer(SuccessBuffer):
@@ -130,12 +176,18 @@ class JsonlSuccessBuffer(SuccessBuffer):
     def __init__(self, path: str, max_size: int, dedup: bool = True, seed: int | None = None):
         super().__init__(max_size=max_size, dedup=dedup, seed=seed)
         self.path = path
+        self.consumed_path = path + ".consumed_keys.jsonl"
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         # Touch file
         if not os.path.exists(path):
             with open(path, "a", encoding="utf-8"):
                 pass
+        if not os.path.exists(self.consumed_path):
+            with open(self.consumed_path, "a", encoding="utf-8"):
+                pass
         self._file_offset = 0
+        self._consumed_offset = 0
+        self._consumed_keys: set[str] = set()
 
     def _serialize(self, item: SuccessBufferItem) -> str:
         payload = {
@@ -146,17 +198,28 @@ class JsonlSuccessBuffer(SuccessBuffer):
         }
         return json.dumps(payload, ensure_ascii=False, default=repr)
 
+    def _lock_file(self, f):
+        try:
+            import fcntl  # noqa: WPS433
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            return fcntl
+        except Exception:
+            return None
+
+    def _unlock_file(self, f, fcntl_mod):
+        if fcntl_mod is None:
+            return
+        try:
+            fcntl_mod.flock(f.fileno(), fcntl_mod.LOCK_UN)
+        except Exception:
+            pass
+
     def append(self, items: list[SuccessBufferItem]) -> int:
         if not items or self.max_size == 0:
             return 0
         with open(self.path, "a", encoding="utf-8") as f:
-            # Best-effort inter-process file lock (Linux/macOS). If unavailable, we still append.
-            try:
-                import fcntl  # noqa: WPS433
-
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            except Exception:
-                fcntl = None  # type: ignore[assignment]
+            fcntl_mod = self._lock_file(f)
             try:
                 for it in items:
                     f.write(self._serialize(it) + "\n")
@@ -166,12 +229,52 @@ class JsonlSuccessBuffer(SuccessBuffer):
                 except Exception:
                     pass
             finally:
-                if fcntl is not None:  # type: ignore[truthy-bool]
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                    except Exception:
-                        pass
+                self._unlock_file(f, fcntl_mod)
         return self.extend(items)
+
+    def _refresh_consumed(self) -> int:
+        inserted = 0
+        try:
+            size = os.path.getsize(self.consumed_path)
+        except OSError:
+            size = 0
+        if size < self._consumed_offset:
+            self._consumed_offset = 0
+
+        with open(self.consumed_path, "r", encoding="utf-8") as f:
+            f.seek(self._consumed_offset)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = obj.get("key")
+                if isinstance(key, str) and key not in self._consumed_keys:
+                    self._consumed_keys.add(key)
+                    inserted += 1
+            self._consumed_offset = f.tell()
+        return inserted
+
+    def _mark_consumed(self, items: list[SuccessBufferItem]) -> None:
+        if not items:
+            return
+        keys = [it.dedup_key() for it in items]
+        with open(self.consumed_path, "a", encoding="utf-8") as f:
+            fcntl_mod = self._lock_file(f)
+            try:
+                for k in keys:
+                    f.write(json.dumps({"key": k}, ensure_ascii=False) + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            finally:
+                self._unlock_file(f, fcntl_mod)
+        self._consumed_keys.update(keys)
 
     def refresh(self) -> int:
         """
@@ -179,6 +282,8 @@ class JsonlSuccessBuffer(SuccessBuffer):
         """
         if self.max_size == 0:
             return 0
+        # Also refresh consumed keys so we don't re-introduce consumed samples.
+        self._refresh_consumed()
         inserted = 0
         # Handle truncation / rotation
         try:
@@ -207,9 +312,18 @@ class JsonlSuccessBuffer(SuccessBuffer):
                     )
                 except Exception:
                     continue
+                # Skip consumed
+                if it.dedup_key() in self._consumed_keys:
+                    continue
                 inserted += int(self.add(it))
             self._file_offset = f.tell()
         return inserted
+
+    def consume_items(self, items: list[SuccessBufferItem]) -> None:
+        if not items:
+            return
+        super().consume_items(items)
+        self._mark_consumed(items)
 
 
 def pooled_advantages(rewards: torch.Tensor, mode: str = "zscore", eps: float = 1e-4) -> torch.Tensor:
@@ -283,10 +397,15 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
             self.cp_args: CrossPolicyGRPOConfig | None = None
             self._cp_buffer = None
             self._cp_opt_steps = 0
+            self._cp_log_prefix = ""
             return
 
         self.cp_args: CrossPolicyGRPOConfig = self.args
         self._cp_opt_steps = 0
+
+        # Create log prefix with policy ID for differentiation
+        policy_id = self.cp_args.cross_policy_policy_id
+        self._cp_log_prefix = f"[Policy{policy_id}] "
 
         # Shared success buffer ℬ
         if self.cp_args.cross_policy_success_buffer_path:
@@ -302,6 +421,18 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                 dedup=self.cp_args.cross_policy_success_buffer_dedup,
                 seed=self.cp_args.seed,
             )
+
+    def _log_cp_metrics(self, metrics: dict[str, float], mode: str = "train") -> None:
+        """
+        Add cross-policy metrics to the parent's metrics dict.
+
+        Metrics are accumulated and logged together with other training metrics
+        when the parent's log() method is called, ensuring proper wandb step handling.
+        """
+        if not metrics:
+            return
+        for key, value in metrics.items():
+            self._metrics[mode][key].append(value)
 
     # --- Success buffer update hook ---
     def _post_process_rewards(
@@ -350,12 +481,27 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
             # `gather_object` returns one object per process
             all_items: list[SuccessBufferItem] = []
             for obj in gathered:
-                if obj:
+                if not obj:
+                    continue
+                if isinstance(obj, list):
                     all_items.extend(obj)
+                else:
+                    all_items.append(obj)
             if isinstance(self._cp_buffer, JsonlSuccessBuffer):
-                self._cp_buffer.append(all_items)
+                added = self._cp_buffer.append(all_items)
             else:
-                self._cp_buffer.extend(all_items)
+                added = self._cp_buffer.extend(all_items)
+            if added:
+                logger.info(
+                    f"{self._cp_log_prefix}[CrossPolicy] Added {added} successes "
+                    f"(buffer size={len(self._cp_buffer)})"
+                )
+                self._log_cp_metrics(
+                    {
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/added": float(added),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                    }
+                )
 
     # --- SFT loss on buffer samples ---
     def _compute_cross_policy_sft_loss(
@@ -423,7 +569,47 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
         if isinstance(self._cp_buffer, JsonlSuccessBuffer):
             # Best-effort refresh before sampling
             self._cp_buffer.refresh()
-        return self._cp_buffer.sample(k, exclude_src=int(self.cp_args.cross_policy_policy_id))
+        consume = bool(self.cp_args.cross_policy_success_buffer_consumable)
+        require_full = bool(getattr(self.cp_args, "cross_policy_sft_require_full_batch", False))
+        exclude_src = int(self.cp_args.cross_policy_policy_id)
+
+        if require_full:
+            batch = self._cp_buffer.sample(k, exclude_src=exclude_src, consume=consume)
+            if len(batch) < k:
+                _log_info(
+                    f"{self._cp_log_prefix}[CrossPolicy] Skip SFT (need {k}, available {len(batch)}, buffer {len(self._cp_buffer)})"
+                )
+                self._log_cp_metrics(
+                    {
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/skip": 1.0,
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                    }
+                )
+                return []
+            if consume:
+                self._cp_buffer.consume_items(batch)
+        else:
+            batch = self._cp_buffer.sample(k, exclude_src=exclude_src, consume=consume)
+        if batch:
+            _log_info(
+                f"{self._cp_log_prefix}[CrossPolicy] Pulled {len(batch)} samples for SFT "
+                f"(consume={consume}, buffer {len(self._cp_buffer)})"
+            )
+            self._log_cp_metrics(
+                {
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/batch_size": float(len(batch)),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                }
+            )
+        else:
+            _log_info(f"{self._cp_log_prefix}[CrossPolicy] Skip SFT (buffer empty)")
+            self._log_cp_metrics(
+                {
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/skip": 1.0,
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                }
+            )
+        return batch
 
     # --- Stage 6 (s==1) mixing ---
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -440,11 +626,28 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
         if s == 1 and alpha > 0.0 and sft_bs > 0:
             batch = self._sample_cross_policy_sft_batch(sft_bs)
             if batch:
+                grpo_loss = loss
                 with self.compute_loss_context_manager():
                     sft_loss = self._compute_cross_policy_sft_loss(model, batch)
                 # Scale similarly to per-step losses under grad-accumulation
                 sft_loss = sft_loss / max(int(self.current_gradient_accumulation_steps), 1)
-                loss = (1.0 - alpha) * loss + alpha * sft_loss
+                loss =  loss + alpha * sft_loss
+                _log_info(
+                    f"{self._cp_log_prefix}[CrossPolicy] Mixed SFT into GRPO step "
+                    f"(alpha={alpha}, batch={len(batch)})"
+                )
+                self._log_cp_metrics(
+                    {
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/mixed_batch_size": float(len(batch)),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/alpha": float(alpha),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/loss/grpo": float(grpo_loss.detach().item()),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/loss/sft": float(sft_loss.detach().item()),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                    }
+                )
+            else:
+                _log_info(f"{self._cp_log_prefix}[CrossPolicy] Mixed SFT skipped (no buffer batch)")
+                self._log_cp_metrics({f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/mixed_skip": 1.0})
         return loss
 
     # --- Stage 7 (s!=1) periodic SFT-only extra steps ---
@@ -481,12 +684,24 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
         for _ in range(sft_steps):
             batch = self._sample_cross_policy_sft_batch(sft_bs)
             if not batch:
+                _log_info(f"{self._cp_log_prefix}[CrossPolicy] Stage-7 SFT skipped (buffer empty)")
+                self._log_cp_metrics({f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_skip": 1.0})
                 break
             optimizer.zero_grad(set_to_none=True)
             with self.compute_loss_context_manager():
                 sft_loss = self._compute_cross_policy_sft_loss(model, batch)
             self.accelerator.backward(sft_loss)
             optimizer.step()
+            _log_info(
+                f"{self._cp_log_prefix}[CrossPolicy] Stage-7 SFT step finished "
+                f"(batch={len(batch)})"
+            )
+            self._log_cp_metrics(
+                {
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_batch_size": float(len(batch)),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                }
+            )
 
         return out
 

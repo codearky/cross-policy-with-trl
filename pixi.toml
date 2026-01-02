@@ -2,7 +2,7 @@
 name = "cross-policy-with-trl"
 version = "0.0.1"
 description = "Cross-policy GRPO experiments on top of TRL (editable install)."
-channels = ["conda-forge", "pytorch", "nvidia"]
+channels = ["nvidia", "pytorch", "conda-forge"]
 platforms = ["linux-64"]
 
 [dependencies]
@@ -20,15 +20,24 @@ trl = { path = "trl", editable = true }
 transformers = ">=4.56.1"
 accelerate = ">=1.4.0"
 datasets = ">=3.0.0"
+# Logging
+wandb = "*"
 # Common Qwen tokenizer/runtime extras
 sentencepiece = "*"
 tiktoken = "*"
 einops = "*"
 num2words = "==0.5.14"
+pylatexenc = "*"  # For math_utils LaTeX handling
+rich = ">=13.0.0"  # For TRL completion logging
 
 [tasks]
-train-cross-policy = "python trl/examples/scripts/cross_policy_grpo.py --reset_buffer"
+train-cp = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1"
+train-baseline = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3"
 train-policy0 = "python trl/examples/scripts/cross_policy_grpo.py --policy_id 0"
 train-policy1 = "python trl/examples/scripts/cross_policy_grpo.py --policy_id 1"
+
+# 700-step runs with eval on 100 examples from test set
+train-cp-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1 --max_steps 700 --eval_split test --max_eval_samples 100 --eval_steps 700 --prompt_styles instruct"
+train-baseline-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3 --max_steps 700 --eval_split test --max_eval_samples 100 --eval_steps 700 --prompt_styles instruct"
 
 

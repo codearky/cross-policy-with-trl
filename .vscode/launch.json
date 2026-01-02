@@ -1,0 +1,94 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug: train-cp (Cross-Policy)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/trl/examples/scripts/cross_policy_grpo.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--train_split",
+                "train",
+                "--reset_buffer",
+                "--gpus",
+                "0,1"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/trl",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Debug: train-baseline",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/trl/examples/scripts/cross_policy_grpo.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--train_split",
+                "train",
+                "--baseline",
+                "--gpus",
+                "2,3"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/trl",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Debug: train-policy0",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/trl/examples/scripts/cross_policy_grpo.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--policy_id",
+                "0"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/trl",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Debug: train-policy1",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/trl/examples/scripts/cross_policy_grpo.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--policy_id",
+                "1"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/trl",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Debug: Custom Args",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/trl/examples/scripts/cross_policy_grpo.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/trl",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
+
