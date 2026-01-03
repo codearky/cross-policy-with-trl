@@ -29,6 +29,7 @@ einops = "*"
 num2words = "==0.5.14"
 pylatexenc = "*"  # For math_utils LaTeX handling
 rich = ">=13.0.0"  # For TRL completion logging
+peft = "*"
 
 [tasks]
 train-cp = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1"

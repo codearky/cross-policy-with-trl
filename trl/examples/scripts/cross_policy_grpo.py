@@ -43,6 +43,7 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset
+from peft import LoraConfig
 
 from trl import CrossPolicyGRPOConfig, CrossPolicyGRPOTrainer, GRPOConfig, GRPOTrainer
 
@@ -83,6 +84,7 @@ def train_one_policy(
     alpha: float,
     sft_batch_size: int,
     tau: float,
+    warmup_steps: int,
     gpu_id: int | None = None,
     eval_dataset: Dataset | None = None,
     eval_steps: int | None = None,
@@ -117,6 +119,7 @@ def train_one_policy(
         output_dir=output_dir,
         max_steps=max_steps,
         per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=num_generations,  # Must be divisible by num_generations
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_generations=num_generations,
         max_completion_length=max_completion_length,
@@ -132,10 +135,24 @@ def train_one_policy(
         cross_policy_interval=1,  # s=1
         cross_policy_mix_alpha=alpha,
         cross_policy_sft_batch_size=sft_batch_size,
+        cross_policy_warmup_steps=warmup_steps,
         cross_policy_success_threshold=tau,
         cross_policy_success_buffer_path=success_buffer_path,
+        scale_rewards="none",  # Avoid z-score normalization for larger GRPO gradients
     )
-    args.model_init_kwargs = {"dtype": model_dtype}
+    # Explicitly set device_map to pin model to specific GPU (device_map="auto" would use GPU 0)
+    device_map = f"cuda:{gpu_id}" if gpu_id is not None else "auto"
+    args.model_init_kwargs = {"dtype": model_dtype, "device_map": device_map}
+
+    # LoRA configuration with rank 64 and alpha 64
+    peft_config = LoraConfig(
+        r=64,
+        lora_alpha=64,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
 
     trainer = CrossPolicyGRPOTrainer(
         model=model_name_or_path,
@@ -143,6 +160,7 @@ def train_one_policy(
         args=args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        peft_config=peft_config,
     )
 
     # Log model metadata to W&B
@@ -167,13 +185,17 @@ def _train_worker(model_name_or_path, policy_id, train_dataset, output_dir, succ
     """
     Worker function for multiprocessing. Must be at module level to be picklable.
     """
+    # CRITICAL: Set CUDA_VISIBLE_DEVICES before any CUDA initialization
+    # This ensures the process only sees its assigned GPU (which becomes cuda:0)
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     train_one_policy(
         model_name_or_path=model_name_or_path,
         policy_id=policy_id,
         train_dataset=train_dataset,
         output_dir=output_dir,
         success_buffer_path=success_buffer_path,
-        gpu_id=gpu_id,
+        gpu_id=0,  # After CUDA_VISIBLE_DEVICES, the target GPU becomes cuda:0
         eval_dataset=eval_dataset,
         **train_kwargs,
     )
@@ -241,8 +263,21 @@ def train_baseline_policy(
         logging_steps=20,
         remove_unused_columns=False,  # keep `answer` for the reward function
         log_completions=True,
+        scale_rewards="none",  # Avoid z-score normalization for larger GRPO gradients
     )
-    args.model_init_kwargs = {"dtype": model_dtype}
+    # Explicitly set device_map to pin model to specific GPU (device_map="auto" would use GPU 0)
+    device_map = f"cuda:{gpu_id}" if gpu_id is not None else "auto"
+    args.model_init_kwargs = {"dtype": model_dtype, "device_map": device_map}
+
+    # LoRA configuration with rank 64 and alpha 64
+    peft_config = LoraConfig(
+        r=64,
+        lora_alpha=64,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
 
     trainer = GRPOTrainer(
         model=model_name_or_path,
@@ -250,6 +285,7 @@ def train_baseline_policy(
         args=args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        peft_config=peft_config,
     )
 
     # Log model metadata to W&B
@@ -275,12 +311,16 @@ def _baseline_worker(model_name_or_path, policy_id, train_dataset, output_dir, g
     """
     Worker function for baseline multiprocessing. Must be at module level to be picklable.
     """
+    # CRITICAL: Set CUDA_VISIBLE_DEVICES before any CUDA initialization
+    # This ensures the process only sees its assigned GPU (which becomes cuda:0)
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     train_baseline_policy(
         model_name_or_path=model_name_or_path,
         policy_id=policy_id,
         train_dataset=train_dataset,
         output_dir=output_dir,
-        gpu_id=gpu_id,
+        gpu_id=0,  # After CUDA_VISIBLE_DEVICES, the target GPU becomes cuda:0
         eval_dataset=eval_dataset,
         **train_kwargs,
     )
@@ -365,13 +405,19 @@ def main():
     parser.add_argument("--max_steps", type=int, default=-1, help="Max training steps (-1 for no limit)")
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
-    parser.add_argument("--num_generations", type=int, default=8)
+    parser.add_argument("--num_generations", type=int, default=16)
     parser.add_argument("--max_completion_length", type=int, default=512)
 
     # Cross-policy knobs (s=1 mixing)
-    parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--sft_batch_size", type=int, default=8)
     parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="Optimizer steps to run before enabling cross-policy mixed loss (s=1).",
+    )
 
     args = parser.parse_args()
 
@@ -396,8 +442,8 @@ def main():
 
     models = [
         # "Qwen/Qwen2.5-0.5B",
-        "Qwen/Qwen2.5-0.5B-Instruct",
-        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen2.5-3B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct",
     ]
     num_policies = len(models)
 
@@ -470,13 +516,13 @@ def main():
         # Baseline mode: regular GRPO without cross-policy mixing
         baseline_kwargs = {
             "max_steps": args.max_steps,
-            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "per_device_train_batch_size": args.per_device_train_batch_size + 4,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "num_generations": args.num_generations,
             "max_completion_length": args.max_completion_length,
             "eval_steps": args.eval_steps,
         }
-
+        print(f"baseline_kwargs: {baseline_kwargs}")
         def run_baseline(pid: int, gpu_id: int | None = None):
             train_baseline_policy(
                 model_name_or_path=models[pid],
@@ -523,6 +569,7 @@ def main():
             "alpha": args.alpha,
             "sft_batch_size": args.sft_batch_size,
             "tau": args.tau,
+            "warmup_steps": args.warmup_steps,
             "eval_steps": args.eval_steps,
         }
 

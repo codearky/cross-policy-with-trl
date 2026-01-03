@@ -500,6 +500,9 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                     {
                         f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/added": float(added),
                         f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
+                            self._cp_buffer.available_count(exclude_src=self.cp_args.cross_policy_policy_id)
+                        ),
                     }
                 )
 
@@ -583,6 +586,9 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                     {
                         f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/skip": 1.0,
                         f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
+                            self._cp_buffer.available_count(exclude_src=exclude_src)
+                        ),
                     }
                 )
                 return []
@@ -599,6 +605,9 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                 {
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/batch_size": float(len(batch)),
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
+                        self._cp_buffer.available_count(exclude_src=exclude_src)
+                    ),
                 }
             )
         else:
@@ -607,6 +616,9 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                 {
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/skip": 1.0,
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
+                        self._cp_buffer.available_count(exclude_src=exclude_src)
+                    ),
                 }
             )
         return batch
@@ -622,32 +634,51 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
         s = int(self.cp_args.cross_policy_interval)
         alpha = float(self.cp_args.cross_policy_mix_alpha)
         sft_bs = int(self.cp_args.cross_policy_sft_batch_size)
+        warmup_steps = max(int(getattr(self.cp_args, "cross_policy_warmup_steps", 0)), 0)
 
         if s == 1 and alpha > 0.0 and sft_bs > 0:
-            batch = self._sample_cross_policy_sft_batch(sft_bs)
-            if batch:
-                grpo_loss = loss
-                with self.compute_loss_context_manager():
-                    sft_loss = self._compute_cross_policy_sft_loss(model, batch)
-                # Scale similarly to per-step losses under grad-accumulation
-                sft_loss = sft_loss / max(int(self.current_gradient_accumulation_steps), 1)
-                loss =  loss + alpha * sft_loss
+            if warmup_steps > 0 and self._cp_opt_steps < warmup_steps:
+                remaining = warmup_steps - self._cp_opt_steps
                 _log_info(
-                    f"{self._cp_log_prefix}[CrossPolicy] Mixed SFT into GRPO step "
-                    f"(alpha={alpha}, batch={len(batch)})"
+                    f"{self._cp_log_prefix}[CrossPolicy] Warmup active "
+                    f"({self._cp_opt_steps}/{warmup_steps}); skip SFT mixing"
                 )
                 self._log_cp_metrics(
                     {
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/mixed_batch_size": float(len(batch)),
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/alpha": float(alpha),
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/loss/grpo": float(grpo_loss.detach().item()),
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/loss/sft": float(sft_loss.detach().item()),
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/warmup_skip": 1.0,
+                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/warmup_remaining": float(
+                            max(remaining, 0)
+                        ),
                     }
                 )
             else:
-                _log_info(f"{self._cp_log_prefix}[CrossPolicy] Mixed SFT skipped (no buffer batch)")
-                self._log_cp_metrics({f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/mixed_skip": 1.0})
+                batch = self._sample_cross_policy_sft_batch(sft_bs)
+                if batch:
+                    grpo_loss = loss
+                    with self.compute_loss_context_manager():
+                        sft_loss = self._compute_cross_policy_sft_loss(model, batch)
+                    # Scale similarly to per-step losses under grad-accumulation
+                    sft_loss = sft_loss / max(int(self.current_gradient_accumulation_steps), 1)
+                    loss = loss + alpha * sft_loss
+                    _log_info(
+                        f"{self._cp_log_prefix}[CrossPolicy] Mixed SFT into GRPO step "
+                        f"(alpha={alpha}, batch={len(batch)})"
+                    )
+                    self._log_cp_metrics(
+                        {
+                            f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/mixed_batch_size": float(len(batch)),
+                            f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/alpha": float(alpha),
+                            f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/loss/grpo": float(grpo_loss.detach().item()),
+                            f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/loss/sft": float(sft_loss.detach().item()),
+                            f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                            f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
+                                self._cp_buffer.available_count(exclude_src=self.cp_args.cross_policy_policy_id)
+                            ),
+                        }
+                    )
+                else:
+                    _log_info(f"{self._cp_log_prefix}[CrossPolicy] Mixed SFT skipped (no buffer batch)")
+                    self._log_cp_metrics({f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/mixed_skip": 1.0})
         return loss
 
     # --- Stage 7 (s!=1) periodic SFT-only extra steps ---
@@ -700,6 +731,9 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                 {
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_batch_size": float(len(batch)),
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
+                        self._cp_buffer.available_count(exclude_src=self.cp_args.cross_policy_policy_id)
+                    ),
                 }
             )
 

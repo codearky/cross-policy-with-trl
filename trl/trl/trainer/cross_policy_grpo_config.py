@@ -106,5 +106,12 @@ class CrossPolicyGRPOConfig(GRPOConfig):
             "L = (1-α)*L_GRPO + α*L_SFT. Set to 0 to disable mixing."
         },
     )
+    cross_policy_warmup_steps: int = field(
+        default=0,
+        metadata={
+            "help": "Number of optimizer steps to run before enabling cross-policy SFT mixing when s==1. "
+            "During warmup, training behaves like standard GRPO (no mixed loss)."
+        },
+    )
 
 
