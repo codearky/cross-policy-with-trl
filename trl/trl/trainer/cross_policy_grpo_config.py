@@ -113,5 +113,12 @@ class CrossPolicyGRPOConfig(GRPOConfig):
             "During warmup, training behaves like standard GRPO (no mixed loss)."
         },
     )
+    cross_policy_buffer_warmup_steps: int = field(
+        default=0,
+        metadata={
+            "help": "Number of optimizer steps to run before appending successes to the shared buffer. "
+            "During buffer warmup, successes are ignored (no writes to ℬ)."
+        },
+    )
 
 

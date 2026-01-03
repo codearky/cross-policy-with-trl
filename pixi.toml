@@ -38,7 +38,7 @@ train-policy0 = "python trl/examples/scripts/cross_policy_grpo.py --policy_id 0"
 train-policy1 = "python trl/examples/scripts/cross_policy_grpo.py --policy_id 1"
 
 # 700-step runs with eval on 100 examples from test set
-train-cp-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1 --max_steps 700 --eval_split test --max_eval_samples 100 --eval_steps 700 --prompt_styles instruct"
-train-baseline-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3 --max_steps 700 --eval_split test --max_eval_samples 100 --eval_steps 700 --prompt_styles instruct"
+train-cp-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1 --eval_split test --max_eval_samples 100 --eval_steps 1400 --prompt_styles instruct"
+train-baseline-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3 --eval_split test --max_eval_samples 100 --eval_steps 1400 --prompt_styles instruct"
 
 

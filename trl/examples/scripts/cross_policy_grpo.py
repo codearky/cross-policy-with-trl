@@ -85,6 +85,7 @@ def train_one_policy(
     sft_batch_size: int,
     tau: float,
     warmup_steps: int,
+    buffer_warmup_steps: int,
     gpu_id: int | None = None,
     eval_dataset: Dataset | None = None,
     eval_steps: int | None = None,
@@ -136,6 +137,7 @@ def train_one_policy(
         cross_policy_mix_alpha=alpha,
         cross_policy_sft_batch_size=sft_batch_size,
         cross_policy_warmup_steps=warmup_steps,
+        cross_policy_buffer_warmup_steps=buffer_warmup_steps,
         cross_policy_success_threshold=tau,
         cross_policy_success_buffer_path=success_buffer_path,
         scale_rewards="none",  # Avoid z-score normalization for larger GRPO gradients
@@ -415,8 +417,14 @@ def main():
     parser.add_argument(
         "--warmup_steps",
         type=int,
-        default=0,
+        default=400,
         help="Optimizer steps to run before enabling cross-policy mixed loss (s=1).",
+    )
+    parser.add_argument(
+        "--buffer_warmup_steps",
+        type=int,
+        default=300,
+        help="Optimizer steps to run before writing successes to the shared buffer.",
     )
 
     args = parser.parse_args()
@@ -570,6 +578,7 @@ def main():
             "sft_batch_size": args.sft_batch_size,
             "tau": args.tau,
             "warmup_steps": args.warmup_steps,
+            "buffer_warmup_steps": args.buffer_warmup_steps,
             "eval_steps": args.eval_steps,
         }
 

@@ -452,6 +452,23 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
         if self._cp_buffer is None or self.cp_args.cross_policy_success_buffer_size <= 0:
             return
 
+        buffer_warmup_steps = max(int(getattr(self.cp_args, "cross_policy_buffer_warmup_steps", 0)), 0)
+        if buffer_warmup_steps > 0 and self._cp_opt_steps < buffer_warmup_steps:
+            remaining = buffer_warmup_steps - self._cp_opt_steps
+            _log_info(
+                f"{self._cp_log_prefix}[CrossPolicy] Buffer warmup active "
+                f"({self._cp_opt_steps}/{buffer_warmup_steps}); skip buffer append"
+            )
+            self._log_cp_metrics(
+                {
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/warmup_skip": 1.0,
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/warmup_remaining": float(
+                        max(remaining, 0)
+                    ),
+                }
+            )
+            return
+
         tau = float(self.cp_args.cross_policy_success_threshold)
         if tau is None:
             return
