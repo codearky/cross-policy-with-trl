@@ -76,6 +76,34 @@
             "cwd": "${workspaceFolder}"
         },
         {
+            "name": "Debug: train-cp-s7-eval (no warmup)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/trl/examples/scripts/cross_policy_grpo.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--train_split", "train",
+                "--reset_buffer",
+                "--gpus", "2,3",
+                "--eval_split", "test",
+                "--max_eval_samples", "100",
+                "--eval_steps", "1400",
+                "--prompt_styles", "instruct",
+                "--cross_policy_interval", "2",
+                "--cross_policy_sft_steps", "50",
+                "--sft_batch_size", "32",
+                "--warmup_steps", "0",
+                "--buffer_warmup_steps", "0"
+
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/trl",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "Debug: Custom Args",
             "type": "debugpy",
             "request": "launch",

@@ -120,5 +120,14 @@ class CrossPolicyGRPOConfig(GRPOConfig):
             "During buffer warmup, successes are ignored (no writes to ℬ)."
         },
     )
+    cross_policy_sft_learning_rate: float | None = field(
+        default=None,
+        metadata={
+            "help": "Learning rate for stage-7 cross-policy SFT steps (when s!=1). "
+            "If None, defaults to the main optimizer's learning rate. "
+            "A separate optimizer is used for stage-7 to avoid corrupting the main optimizer's "
+            "momentum state and to prevent unintended LR scheduler advancement."
+        },
+    )
 
 

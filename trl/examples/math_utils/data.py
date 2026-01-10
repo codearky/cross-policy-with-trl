@@ -111,8 +111,28 @@ def format_correct(text: str) -> bool:
 
 
 def filter_function(example, tokenizer: AutoTokenizer) -> bool:
-    # Filter out examples that are too long
+    """
+    Filter out examples that are too long.
+
+    Supports both:
+      - string prompts
+      - conversational prompts (list-of-messages dicts with "role"/"content")
+    """
     prompt = example["prompt"]
+    # Conversational prompts: tokenize via chat template so length matches what the model will see.
+    if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict) and "role" in prompt[0] and "content" in prompt[0]:
+        ids = tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
+        # `apply_chat_template` can return a list[int] or a BatchEncoding-like object depending on tokenizer/version.
+        if isinstance(ids, dict) and "input_ids" in ids:
+            input_ids = ids["input_ids"]
+        elif hasattr(ids, "input_ids"):
+            input_ids = ids.input_ids
+        else:
+            input_ids = ids
+        length = len(input_ids) if isinstance(input_ids, list) else int(input_ids.shape[-1])
+        return length <= 512
+
+    # Plain string prompt
     tokenized_prompt = tokenizer(prompt, return_tensors="pt")
     return tokenized_prompt["input_ids"].shape[1] <= 512
 
@@ -131,14 +151,11 @@ def get_math8k_questions(split: str = "train", style: str = "base") -> Dataset:
     elif style == "instruct":
         data = data.map(
             lambda x: {
-                "prompt": tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
-                        {"role": "user", "content": x["question"]},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ),
+                # Store as messages (not a rendered string) so each policy can apply its own chat template.
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
+                    {"role": "user", "content": x["question"]},
+                ],
                 "answer": x["gt_answer"],
             }
         )
@@ -176,14 +193,11 @@ def get_gsm8k_questions(
     elif style == "instruct":
         data = data.map(
             lambda x: {
-                "prompt": tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
-                        {"role": "user", "content": x["question"]},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ),
+                # Store as messages (not a rendered string) so cross-policy SFT can re-render with the local tokenizer.
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
+                    {"role": "user", "content": x["question"]},
+                ],
                 "answer": extract_gsm8k_answer(x["answer"]),
             }
         )
@@ -226,14 +240,11 @@ def get_math_questions(split: str = "train", style: str = "base") -> Dataset:
     elif style == "instruct":
         data = data.map(
             lambda x: {
-                "prompt": tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
-                        {"role": "user", "content": x["problem"]},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ),
+                # Store as messages (not a rendered string) so each policy can apply its own chat template.
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
+                    {"role": "user", "content": x["problem"]},
+                ],
                 "answer": extract_math_answer(x["solution"]),
             }
         )
@@ -257,14 +268,11 @@ def get_math500_questions(split: str = "test", style: str = "base") -> Dataset:
     elif style == "instruct":
         data = data.map(
             lambda x: {
-                "prompt": tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
-                        {"role": "user", "content": x["problem"]},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ),
+                # Store as messages (not a rendered string) so each policy can apply its own chat template.
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
+                    {"role": "user", "content": x["problem"]},
+                ],
                 "answer": x["answer"],
             }
         )
@@ -288,14 +296,11 @@ def get_amc23_questions(split: str = "test", style: str = "base") -> Dataset:
     elif style == "instruct":
         data = data.map(
             lambda x: {
-                "prompt": tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
-                        {"role": "user", "content": x["question"]},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ),
+                # Store as messages (not a rendered string) so each policy can apply its own chat template.
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT_INSTRUCT},
+                    {"role": "user", "content": x["question"]},
+                ],
                 "answer": str(int(x["answer"])),
             }
         )

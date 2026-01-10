@@ -8,10 +8,6 @@ platforms = ["linux-64"]
 [dependencies]
 python = ">=3.10,<3.12"
 pip = "*"
-# Torch is intentionally installed via conda for reliability.
-pytorch = ">=2.4"
-pytorch-cuda = "12.1.*"
-pandas = "*"
 
 [pypi-dependencies]
 # Install this repo's TRL fork as editable from ./trl
@@ -31,6 +27,30 @@ pylatexenc = "*"  # For math_utils LaTeX handling
 rich = ">=13.0.0"  # For TRL completion logging
 peft = "*"
 
+[feature.base.dependencies]
+# Base feature with conda pytorch and pandas for default environment
+pandas = "*"
+pytorch = ">=2.4"
+pytorch-cuda = "12.1.*"
+
+[feature.vllm.pypi-dependencies]
+# vllm extra dependencies for TRL - installing all deps via pip to avoid conda conflicts
+# Using vllm 0.10.2 (minimum version supported by TRL) with torch 2.8.0
+pandas = "*"
+numpy = "<2.3"
+torch = "==2.8.0"
+vllm = "==0.10.2"
+fastapi = "*"
+pydantic = "*"
+requests = "*"
+uvicorn = "*"
+
+[environments]
+# Default environment uses base feature with conda pytorch
+default = {features = ["base"], solve-group = "default"}
+# vllm environment with pip-installed torch for vllm compatibility (no conda pytorch)
+vllm = {features = ["vllm"], solve-group = "vllm-solve"}
+
 [tasks]
 train-cp = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1"
 train-baseline = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3"
@@ -40,5 +60,17 @@ train-policy1 = "python trl/examples/scripts/cross_policy_grpo.py --policy_id 1"
 # 700-step runs with eval on 100 examples from test set
 train-cp-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1 --eval_split test --max_eval_samples 100 --eval_steps 1400 --prompt_styles instruct"
 train-baseline-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3 --eval_split test --max_eval_samples 100 --eval_steps 1400 --prompt_styles instruct"
+train-cp-s7-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 2,3 --eval_split test --max_eval_samples 100 --eval_steps 1400 --prompt_styles instruct --cross_policy_interval 100 --cross_policy_sft_steps 50 --sft_batch_size 32"
+
+# Same-model explore/exploit: Qwen 2.5 Instruct with temp=1.0 and temp=1.2 (auto-assigned)
+train-cp-qwen-same = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1 --models 'Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-3B-Instruct' --prompt_styles instruct --save_steps 100 --save_total_limit 3"
+train-cp-qwen-same-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1 --models 'Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-3B-Instruct' --prompt_styles instruct --eval_split test --max_eval_samples 100 --eval_steps 700 --save_steps 100 --save_total_limit 3"
+train-cp-qwen-same-s7-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 2,3 --models 'Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-3B-Instruct' --prompt_styles instruct --eval_split test --max_eval_samples 100 --eval_steps 700 --cross_policy_interval 100 --cross_policy_sft_steps 50 --sft_batch_size 32 --save_steps 100 --save_total_limit 3"
+train-baseline-qwen-same = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3 --models 'Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-3B-Instruct' --prompt_styles instruct --save_steps 100 --save_total_limit 3"
+train-baseline-qwen-same-eval = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3 --models 'Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-3B-Instruct' --prompt_styles instruct --eval_split test --max_eval_samples 100 --eval_steps 700 --save_steps 100 --save_total_limit 3"
+
+# Training with checkpointing (saves adapter every 100 steps, keeps last 3 checkpoints)
+train-cp-ckpt = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --reset_buffer --gpus 0,1 --save_steps 100 --save_total_limit 3"
+train-baseline-ckpt = "python trl/examples/scripts/cross_policy_grpo.py --train_split train --baseline --gpus 2,3 --save_steps 100 --save_total_limit 3"
 
 

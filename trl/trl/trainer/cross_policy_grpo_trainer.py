@@ -402,6 +402,7 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
 
         self.cp_args: CrossPolicyGRPOConfig = self.args
         self._cp_opt_steps = 0
+        self._cp_sft_optimizer: torch.optim.Optimizer | None = None  # Created lazily for stage-7
 
         # Create log prefix with policy ID for differentiation
         policy_id = self.cp_args.cross_policy_policy_id
@@ -421,6 +422,62 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                 dedup=self.cp_args.cross_policy_success_buffer_dedup,
                 seed=self.cp_args.seed,
             )
+
+    def _cp_get_opt_steps(self) -> int:
+        """
+        Best-effort optimizer step counter used for warmup gates.
+
+        Prefer the tracked `_cp_opt_steps`, but fall back to the Trainer
+        `state.global_step` when available (covers cases where the HF
+        training loop updates `global_step` but our local counter lags).
+        """
+        # This line retrieves the 'global_step' attribute from the 'state' object of the trainer.
+        # If 'state' does not exist, it defaults to None, and if 'global_step' does not exist, it defaults to 0.
+        gs = getattr(getattr(self, "state", None), "global_step", 0)
+        try:
+            return max(int(self._cp_opt_steps), int(gs))
+        except Exception:
+            return int(self._cp_opt_steps)
+
+    def _get_or_create_sft_optimizer(self, model: PreTrainedModel) -> torch.optim.Optimizer:
+        """
+        Lazily create a separate optimizer for stage-7 SFT steps.
+
+        This avoids:
+        1. Corrupting the main optimizer's momentum/variance state with SFT gradients
+        2. Inadvertently advancing the learning rate scheduler
+        3. Forces a potentially different learning rate for SFT
+
+        The optimizer is created once and reused for all stage-7 SFT steps.
+        """
+        if self._cp_sft_optimizer is not None:
+            return self._cp_sft_optimizer
+
+        # Determine learning rate: use configured SFT LR or fall back to main optimizer's current LR
+        sft_lr = self.cp_args.cross_policy_sft_learning_rate
+        if sft_lr is None:
+            # Fall back to main optimizer's learning rate
+            try:
+                sft_lr = self.optimizer.param_groups[0]["lr"]
+            except (AttributeError, KeyError, IndexError):
+                sft_lr = self.args.learning_rate
+        sft_lr = float(sft_lr)
+
+        # Use AdamW with the same beta/eps as typical HF defaults
+        # We deliberately don't copy the main optimizer's state to keep SFT updates independent
+        self._cp_sft_optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=sft_lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=self.args.weight_decay if hasattr(self.args, "weight_decay") else 0.0,
+        )
+
+        _log_info(
+            f"{self._cp_log_prefix}[CrossPolicy] Created separate SFT optimizer "
+            f"(lr={sft_lr}, weight_decay={self._cp_sft_optimizer.param_groups[0].get('weight_decay', 0.0)})"
+        )
+        return self._cp_sft_optimizer
 
     def _log_cp_metrics(self, metrics: dict[str, float], mode: str = "train") -> None:
         """
@@ -453,11 +510,12 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
             return
 
         buffer_warmup_steps = max(int(getattr(self.cp_args, "cross_policy_buffer_warmup_steps", 0)), 0)
-        if buffer_warmup_steps > 0 and self._cp_opt_steps < buffer_warmup_steps:
-            remaining = buffer_warmup_steps - self._cp_opt_steps
+        opt_steps = self._cp_get_opt_steps()
+        if buffer_warmup_steps > 0 and opt_steps < buffer_warmup_steps:
+            remaining = buffer_warmup_steps - opt_steps
             _log_info(
                 f"{self._cp_log_prefix}[CrossPolicy] Buffer warmup active "
-                f"({self._cp_opt_steps}/{buffer_warmup_steps}); skip buffer append"
+                f"({opt_steps}/{buffer_warmup_steps}); skip buffer append"
             )
             self._log_cp_metrics(
                 {
@@ -504,7 +562,9 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                     all_items.extend(obj)
                 else:
                     all_items.append(obj)
+            # Refresh buffer to load items from other policies before appending/logging.
             if isinstance(self._cp_buffer, JsonlSuccessBuffer):
+                self._cp_buffer.refresh()
                 added = self._cp_buffer.append(all_items)
             else:
                 added = self._cp_buffer.extend(all_items)
@@ -513,15 +573,16 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                     f"{self._cp_log_prefix}[CrossPolicy] Added {added} successes "
                     f"(buffer size={len(self._cp_buffer)})"
                 )
-                self._log_cp_metrics(
-                    {
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/added": float(added),
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
-                        f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
-                            self._cp_buffer.available_count(exclude_src=self.cp_args.cross_policy_policy_id)
-                        ),
-                    }
-                )
+            # Always log buffer metrics (including available from other policies).
+            self._log_cp_metrics(
+                {
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/added": float(added),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
+                        self._cp_buffer.available_count(exclude_src=self.cp_args.cross_policy_policy_id)
+                    ),
+                }
+            )
 
     # --- SFT loss on buffer samples ---
     def _compute_cross_policy_sft_loss(
@@ -652,13 +713,14 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
         alpha = float(self.cp_args.cross_policy_mix_alpha)
         sft_bs = int(self.cp_args.cross_policy_sft_batch_size)
         warmup_steps = max(int(getattr(self.cp_args, "cross_policy_warmup_steps", 0)), 0)
+        opt_steps = self._cp_get_opt_steps()
 
         if s == 1 and alpha > 0.0 and sft_bs > 0:
-            if warmup_steps > 0 and self._cp_opt_steps < warmup_steps:
-                remaining = warmup_steps - self._cp_opt_steps
+            if warmup_steps > 0 and opt_steps < warmup_steps:
+                remaining = warmup_steps - opt_steps
                 _log_info(
                     f"{self._cp_log_prefix}[CrossPolicy] Warmup active "
-                    f"({self._cp_opt_steps}/{warmup_steps}); skip SFT mixing"
+                    f"({opt_steps}/{warmup_steps}); skip SFT mixing"
                 )
                 self._log_cp_metrics(
                     {
@@ -699,25 +761,50 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
         return loss
 
     # --- Stage 7 (s!=1) periodic SFT-only extra steps ---
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
-        # First: normal GRPO step
-        out = super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure=optimizer_closure)
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # Normal GRPO training step (forward, backward, optimizer step if grad accum complete)
+        # This increments self._step
+        output = super().training_step(model, inputs, num_items_in_batch)
 
         if self.cp_args is None:
-            return out
+            return output
+
+        # Check if an optimizer step actually happened (at gradient accumulation boundary)
+        if self._step % self.current_gradient_accumulation_steps != 0:
+            # No optimizer step happened (still accumulating gradients)
+            return output
+
+        # Update our local counter (optimizer steps, not training steps)
+        self._cp_opt_steps = self._step // self.current_gradient_accumulation_steps
 
         s = int(self.cp_args.cross_policy_interval)
         sft_steps = int(self.cp_args.cross_policy_sft_steps)
         sft_bs = int(self.cp_args.cross_policy_sft_batch_size)
-
-        self._cp_opt_steps += 1
+        warmup_steps = max(int(getattr(self.cp_args, "cross_policy_warmup_steps", 0)), 0)
 
         if s == 1 or s <= 0 or sft_steps <= 0 or sft_bs <= 0:
-            return out
+            return output
+
+        opt_steps = self._cp_get_opt_steps()
+        if warmup_steps > 0 and opt_steps < warmup_steps:
+            remaining = warmup_steps - opt_steps
+            _log_info(
+                f"{self._cp_log_prefix}[CrossPolicy] Stage-7 warmup active "
+                f"({opt_steps}/{warmup_steps}); skip SFT-only steps"
+            )
+            self._log_cp_metrics(
+                {
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_warmup_skip": 1.0,
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_warmup_remaining": float(
+                        max(remaining, 0)
+                    ),
+                }
+            )
+            return output
 
         # Only run stage-7 SFT steps every s optimizer steps
         if self._cp_opt_steps % s != 0:
-            return out
+            return output
 
         # Deepspeed/FSDP stepping is more complex; keep it explicit.
         if getattr(self, "is_deepspeed_enabled", False) or getattr(self, "is_fsdp_enabled", False):
@@ -725,28 +812,35 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                 "Cross-policy stage-7 extra SFT steps are currently skipped under DeepSpeed/FSDP. "
                 "Use cross_policy_interval==1 to mix SFT into the main loss instead."
             )
-            return out
+            return output
 
-        model = self.model
         model.train()
+        # Use a separate optimizer for stage-7 SFT to avoid:
+        # 1. Corrupting the main optimizer's momentum/variance state
+        # 2. Inadvertently advancing the LR scheduler
+        # 3. Conflating GRPO and SFT learning rates
+        sft_optimizer = self._get_or_create_sft_optimizer(model)
         for _ in range(sft_steps):
             batch = self._sample_cross_policy_sft_batch(sft_bs)
             if not batch:
                 _log_info(f"{self._cp_log_prefix}[CrossPolicy] Stage-7 SFT skipped (buffer empty)")
                 self._log_cp_metrics({f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_skip": 1.0})
                 break
-            optimizer.zero_grad(set_to_none=True)
+            sft_optimizer.zero_grad(set_to_none=True)
             with self.compute_loss_context_manager():
                 sft_loss = self._compute_cross_policy_sft_loss(model, batch)
             self.accelerator.backward(sft_loss)
-            optimizer.step()
+            sft_optimizer.step()
             _log_info(
                 f"{self._cp_log_prefix}[CrossPolicy] Stage-7 SFT step finished "
-                f"(batch={len(batch)})"
+                f"(batch={len(batch)}, sft_lr={sft_optimizer.param_groups[0]['lr']})"
             )
             self._log_cp_metrics(
                 {
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_batch_size": float(len(batch)),
+                    f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/sft/stage7_lr": float(
+                        sft_optimizer.param_groups[0]["lr"]
+                    ),
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/size": float(len(self._cp_buffer)),
                     f"policy{self.cp_args.cross_policy_policy_id}/cross_policy/buffer/available": float(
                         self._cp_buffer.available_count(exclude_src=self.cp_args.cross_policy_policy_id)
@@ -754,6 +848,6 @@ class CrossPolicyGRPOTrainer(GRPOTrainer):
                 }
             )
 
-        return out
+        return output
 
 

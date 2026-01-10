@@ -39,6 +39,7 @@ import argparse
 import multiprocessing as mp
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -86,9 +87,14 @@ def train_one_policy(
     tau: float,
     warmup_steps: int,
     buffer_warmup_steps: int,
+    cross_policy_interval: int,
+    cross_policy_sft_steps: int,
+    temperature: float = 1.0,
     gpu_id: int | None = None,
     eval_dataset: Dataset | None = None,
     eval_steps: int | None = None,
+    save_steps: int | None = None,
+    save_total_limit: int | None = None,
 ):
     # Model dtype: prefer bf16 when on GPU (works well on Ampere+), else float32.
     model_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -116,6 +122,9 @@ def train_one_policy(
     # Determine eval strategy based on whether eval is requested
     eval_strategy = "steps" if eval_dataset is not None and eval_steps else "no"
 
+    # Determine save strategy based on whether checkpointing is requested
+    save_strategy = "steps" if save_steps else "no"
+
     args = CrossPolicyGRPOConfig(
         output_dir=output_dir,
         max_steps=max_steps,
@@ -124,16 +133,20 @@ def train_one_policy(
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_generations=num_generations,
         max_completion_length=max_completion_length,
+        temperature=temperature,
         beta=0.0,  # keep example lightweight; set >0 for KL-to-reference regularization
         report_to=["wandb"],
         run_name=run_name,
-        save_strategy="no",
+        save_strategy=save_strategy,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
         logging_steps=20,
         remove_unused_columns=False,  # keep `solution` for the reward function
         cross_policy_policy_id=policy_id,
-        cross_policy_interval=1,  # s=1
+        cross_policy_interval=cross_policy_interval,
+        cross_policy_sft_steps=cross_policy_sft_steps,
         cross_policy_mix_alpha=alpha,
         cross_policy_sft_batch_size=sft_batch_size,
         cross_policy_warmup_steps=warmup_steps,
@@ -141,6 +154,8 @@ def train_one_policy(
         cross_policy_success_threshold=tau,
         cross_policy_success_buffer_path=success_buffer_path,
         scale_rewards="none",  # Avoid z-score normalization for larger GRPO gradients
+        # use_vllm=True,
+        # vllm_mode="colocate",
     )
     # Explicitly set device_map to pin model to specific GPU (device_map="auto" would use GPU 0)
     device_map = f"cuda:{gpu_id}" if gpu_id is not None else "auto"
@@ -174,8 +189,9 @@ def train_one_policy(
                     "model_name": model_name_or_path,
                     "policy_id": policy_id,
                     "model_short_name": model_short_name,
+                    "temperature": temperature,
                 })
-                wandb.run.tags = wandb.run.tags + (f"policy{policy_id}", model_short_name)
+                wandb.run.tags = wandb.run.tags + (f"policy{policy_id}", model_short_name, f"temp{temperature}")
         except ImportError:
             pass
 
@@ -214,9 +230,12 @@ def train_baseline_policy(
     gradient_accumulation_steps: int,
     num_generations: int,
     max_completion_length: int,
+    temperature: float = 1.0,
     gpu_id: int | None = None,
     eval_dataset: Dataset | None = None,
     eval_steps: int | None = None,
+    save_steps: int | None = None,
+    save_total_limit: int | None = None,
 ):
     """
     Train a single policy with regular GRPO (no cross-policy mixing).
@@ -249,23 +268,32 @@ def train_baseline_policy(
     # Determine eval strategy based on whether eval is requested
     eval_strategy = "steps" if eval_dataset is not None and eval_steps else "no"
 
+    # Determine save strategy based on whether checkpointing is requested
+    save_strategy = "steps" if save_steps else "no"
+
     args = GRPOConfig(
         output_dir=output_dir,
         max_steps=max_steps,
         per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=num_generations,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_generations=num_generations,
         max_completion_length=max_completion_length,
+        temperature=temperature,
         beta=0.0,  # keep example lightweight; set >0 for KL-to-reference regularization
         report_to=["wandb"],
         run_name=run_name,
-        save_strategy="no",
+        save_strategy=save_strategy,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
         logging_steps=20,
         remove_unused_columns=False,  # keep `answer` for the reward function
-        log_completions=True,
+        log_completions=False,
         scale_rewards="none",  # Avoid z-score normalization for larger GRPO gradients
+        # use_vllm=True,
+        # vllm_mode="colocate",
     )
     # Explicitly set device_map to pin model to specific GPU (device_map="auto" would use GPU 0)
     device_map = f"cuda:{gpu_id}" if gpu_id is not None else "auto"
@@ -300,8 +328,9 @@ def train_baseline_policy(
                     "policy_id": policy_id,
                     "model_short_name": model_short_name,
                     "mode": "baseline",
+                    "temperature": temperature,
                 })
-                wandb.run.tags = wandb.run.tags + ("baseline", model_short_name)
+                wandb.run.tags = wandb.run.tags + ("baseline", model_short_name, f"temp{temperature}")
         except ImportError:
             pass
 
@@ -405,15 +434,37 @@ def main():
 
     # Training knobs (kept small by default; increase for real training)
     parser.add_argument("--max_steps", type=int, default=-1, help="Max training steps (-1 for no limit)")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_generations", type=int, default=16)
     parser.add_argument("--max_completion_length", type=int, default=512)
+    parser.add_argument(
+        "--baseline_batch_size_offset",
+        type=int,
+        default=0,
+        help="Extra batch size to add only in baseline mode (useful if baseline fits a larger batch in VRAM).",
+    )
+    parser.add_argument(
+        "--temperatures",
+        type=str,
+        default=None,
+        help="Comma-separated temperatures per policy (e.g., '1.0,1.2'). "
+             "If same model appears twice, defaults to '1.0,1.2' (second policy explores more).",
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default=None,
+        help="Comma-separated model names/paths (e.g., 'Qwen/Qwen2.5-3B-Instruct,Qwen/Qwen2.5-3B-Instruct'). "
+             "Overrides hardcoded models list.",
+    )
 
     # Cross-policy knobs (s=1 mixing)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--sft_batch_size", type=int, default=8)
     parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--cross_policy_interval", type=int, default=1, help="Cross-policy interval (s)")
+    parser.add_argument("--cross_policy_sft_steps", type=int, default=0, help="Cross-policy SFT gradient steps per interval")
     parser.add_argument(
         "--warmup_steps",
         type=int,
@@ -423,8 +474,28 @@ def main():
     parser.add_argument(
         "--buffer_warmup_steps",
         type=int,
-        default=300,
+        default=200,
         help="Optimizer steps to run before writing successes to the shared buffer.",
+    )
+
+    # Checkpointing arguments
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=None,
+        help="Save adapter checkpoint every N steps. If not set, no intermediate checkpoints are saved.",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=3,
+        help="Maximum number of checkpoints to keep (oldest are deleted). Set to None to keep all.",
+    )
+    parser.add_argument(
+        "--run_id",
+        type=str,
+        default=None,
+        help="Unique run identifier. If not set, a timestamp-based ID is generated to prevent overwriting.",
     )
 
     args = parser.parse_args()
@@ -437,23 +508,64 @@ def main():
     else:
         gpu_ids = [0, 1]  # Default
 
-    # Set output directory based on mode
+    # Generate unique run ID to prevent different runs from overwriting each other
+    if args.run_id:
+        run_id = args.run_id
+    else:
+        # Generate timestamp-based ID: YYYYMMDD_HHMMSS
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"[Config] Run ID: {run_id}")
+
+    # Set output directory based on mode, with unique run_id subdirectory
     if args.baseline:
         base_out = Path(args.output_dir.replace("cross-policy", "baseline") if "cross-policy" in args.output_dir else args.output_dir + "-baseline")
     else:
         base_out = Path(args.output_dir)
+    # Add run_id subdirectory to prevent overwriting between runs
+    base_out = base_out / run_id
     base_out.mkdir(parents=True, exist_ok=True)
+    print(f"[Config] Output directory: {base_out}")
 
     success_buffer_path = args.success_buffer_path or str(base_out / "success_buffer.jsonl")
     if args.reset_buffer and os.path.exists(success_buffer_path):
         os.remove(success_buffer_path)
 
-    models = [
-        # "Qwen/Qwen2.5-0.5B",
-        "Qwen/Qwen2.5-3B-Instruct",
-        "Qwen/Qwen2.5-1.5B-Instruct",
-    ]
+    # Parse models list from CLI or use defaults
+    if args.models:
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        if len(models) < 2:
+            raise ValueError("--models must provide at least 2 model names.")
+    else:
+        models = [
+            # "Qwen/Qwen2.5-0.5B",
+            "Qwen/Qwen2.5-3B-Instruct",
+            # "Qwen/Qwen2.5-1.5B-Instruct",
+            "meta-llama/Llama-3.2-3B-Instruct",
+        ]
     num_policies = len(models)
+
+    # Check if same model appears multiple times (for explore/exploit setup)
+    is_same_model = len(set(models)) < len(models)
+
+    def _parse_temperatures() -> list[float]:
+        """Parse temperatures per policy, auto-assigning for same-model setups."""
+        if args.temperatures:
+            temps = [float(t.strip()) for t in args.temperatures.split(",") if t.strip()]
+            if len(temps) == 1 and num_policies > 1:
+                temps = temps * num_policies
+            if len(temps) != num_policies:
+                raise ValueError(
+                    f"--temperatures must provide 1 or {num_policies} entries; received {len(temps)}."
+                )
+            return temps
+        # Auto-assign temperatures: if same model appears twice, use 1.0 for first, 1.2 for second (explore more)
+        if is_same_model:
+            temps = [1.0 + 0.2 * i for i in range(num_policies)]
+            print(f"[Config] Same model detected; auto-assigning temperatures: {temps}")
+            return temps
+        return [1.0] * num_policies
+
+    policy_temperatures = _parse_temperatures()
 
     def _parse_tokenizer_names() -> list[str | None]:
         if args.tokenizer_names:
@@ -493,8 +605,9 @@ def main():
     eval_datasets = []
     for idx, tokenizer_name in enumerate(policy_tokenizers):
         style = policy_styles[idx]
+        temp = policy_temperatures[idx]
         print(
-            f"  - policy{idx}: model={models[idx]}, tokenizer={tokenizer_name}, style={style}"
+            f"  - policy{idx}: model={models[idx]}, tokenizer={tokenizer_name}, style={style}, temp={temp}"
         )
         ds = build_gsm8k_dataset(
             args.train_split,
@@ -522,15 +635,25 @@ def main():
 
     if args.baseline:
         # Baseline mode: regular GRPO without cross-policy mixing
-        baseline_kwargs = {
-            "max_steps": args.max_steps,
-            "per_device_train_batch_size": args.per_device_train_batch_size + 4,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "num_generations": args.num_generations,
-            "max_completion_length": args.max_completion_length,
-            "eval_steps": args.eval_steps,
-        }
-        print(f"baseline_kwargs: {baseline_kwargs}")
+        # Build per-policy kwargs (each can have different temperature)
+        baseline_kwargs_list = []
+        for pid in range(num_policies):
+            kwargs = {
+                "max_steps": args.max_steps,
+                "per_device_train_batch_size": args.per_device_train_batch_size + args.baseline_batch_size_offset,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "num_generations": args.num_generations,
+                "max_completion_length": args.max_completion_length,
+                "temperature": policy_temperatures[pid],
+                "eval_steps": args.eval_steps,
+                "save_steps": args.save_steps,
+                "save_total_limit": args.save_total_limit,
+            }
+            baseline_kwargs_list.append(kwargs)
+        print(f"baseline_kwargs[0]: {baseline_kwargs_list[0]}")
+        if len(baseline_kwargs_list) > 1 and baseline_kwargs_list[0] != baseline_kwargs_list[1]:
+            print(f"baseline_kwargs[1]: {baseline_kwargs_list[1]}")
+
         def run_baseline(pid: int, gpu_id: int | None = None):
             train_baseline_policy(
                 model_name_or_path=models[pid],
@@ -539,7 +662,7 @@ def main():
                 output_dir=str(base_out / f"baseline{pid}"),
                 gpu_id=gpu_id,
                 eval_dataset=eval_datasets[pid],
-                **baseline_kwargs,
+                **baseline_kwargs_list[pid],
             )
 
         if args.policy_id is not None:
@@ -554,8 +677,8 @@ def main():
             else:
                 print(f"[Baseline] Starting parallel training: {models[0]} on GPU {gpu_ids[0]}, {models[1]} on GPU {gpu_ids[1]}")
                 ctx = mp.get_context("spawn")
-                worker_args_0 = (models[0], 0, train_datasets[0], str(base_out / "baseline0"), gpu_ids[0], baseline_kwargs, eval_datasets[0])
-                worker_args_1 = (models[1], 1, train_datasets[1], str(base_out / "baseline1"), gpu_ids[1], baseline_kwargs, eval_datasets[1])
+                worker_args_0 = (models[0], 0, train_datasets[0], str(base_out / "baseline0"), gpu_ids[0], baseline_kwargs_list[0], eval_datasets[0])
+                worker_args_1 = (models[1], 1, train_datasets[1], str(base_out / "baseline1"), gpu_ids[1], baseline_kwargs_list[1], eval_datasets[1])
                 p0 = ctx.Process(target=_baseline_worker, args=worker_args_0)
                 p1 = ctx.Process(target=_baseline_worker, args=worker_args_1)
                 p0.start()
@@ -568,19 +691,28 @@ def main():
                     print(f"[Baseline] {models[1]} exited with code {p1.exitcode}")
     else:
         # Cross-policy mode
-        train_kwargs = {
-            "max_steps": args.max_steps,
-            "per_device_train_batch_size": args.per_device_train_batch_size,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "num_generations": args.num_generations,
-            "max_completion_length": args.max_completion_length,
-            "alpha": args.alpha,
-            "sft_batch_size": args.sft_batch_size,
-            "tau": args.tau,
-            "warmup_steps": args.warmup_steps,
-            "buffer_warmup_steps": args.buffer_warmup_steps,
-            "eval_steps": args.eval_steps,
-        }
+        # Build per-policy kwargs (each can have different temperature)
+        train_kwargs_list = []
+        for pid in range(num_policies):
+            kwargs = {
+                "max_steps": args.max_steps,
+                "per_device_train_batch_size": args.per_device_train_batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "num_generations": args.num_generations,
+                "max_completion_length": args.max_completion_length,
+                "temperature": policy_temperatures[pid],
+                "alpha": args.alpha,
+                "sft_batch_size": args.sft_batch_size,
+                "tau": args.tau,
+                "warmup_steps": args.warmup_steps,
+                "buffer_warmup_steps": args.buffer_warmup_steps,
+                "cross_policy_interval": args.cross_policy_interval,
+                "cross_policy_sft_steps": args.cross_policy_sft_steps,
+                "eval_steps": args.eval_steps,
+                "save_steps": args.save_steps,
+                "save_total_limit": args.save_total_limit,
+            }
+            train_kwargs_list.append(kwargs)
 
         def run_policy(pid: int, gpu_id: int | None = None):
             train_one_policy(
@@ -591,7 +723,7 @@ def main():
                 success_buffer_path=success_buffer_path,
                 gpu_id=gpu_id,
                 eval_dataset=eval_datasets[pid],
-                **train_kwargs,
+                **train_kwargs_list[pid],
             )
 
         if args.policy_id is not None:
@@ -608,8 +740,8 @@ def main():
                 # Use 'spawn' to avoid CUDA context issues with forking
                 ctx = mp.get_context("spawn")
                 # Prepare arguments for the worker function (must be picklable)
-                worker_args_0 = (models[0], 0, train_datasets[0], str(base_out / "policy0"), success_buffer_path, gpu_ids[0], train_kwargs, eval_datasets[0])
-                worker_args_1 = (models[1], 1, train_datasets[1], str(base_out / "policy1"), success_buffer_path, gpu_ids[1], train_kwargs, eval_datasets[1])
+                worker_args_0 = (models[0], 0, train_datasets[0], str(base_out / "policy0"), success_buffer_path, gpu_ids[0], train_kwargs_list[0], eval_datasets[0])
+                worker_args_1 = (models[1], 1, train_datasets[1], str(base_out / "policy1"), success_buffer_path, gpu_ids[1], train_kwargs_list[1], eval_datasets[1])
                 p0 = ctx.Process(target=_train_worker, args=worker_args_0)
                 p1 = ctx.Process(target=_train_worker, args=worker_args_1)
                 p0.start()
